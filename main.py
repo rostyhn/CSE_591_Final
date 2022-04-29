@@ -5,31 +5,103 @@ import os
 import argparse
 import pickle
 import tensorflow as tf
-import skimage
-from skimage.feature import daisy
-from skimage import data
-#from skimage.measure import label
-#from skimage.measure import regionprops
-#from natsort import natsorted
+from tensorflow import keras
+from skimage.measure import label
+from skimage.measure import regionprops
+import PIL
+from PIL import Image
+from tensorflow.keras import layers
+from natsort import natsorted
 
-def get_daisy_descriptor(img):
-    descriptor = daisy(img,visualize=False)    
-    count = descriptor.shape[0] * descriptor.shape[1]
-    descriptor = descriptor.reshape(count, descriptor.shape[2])
-    return descriptor
+def create_model(img_size, num_classes):
+    def get_model(img_size, num_classes):
+        inputs = keras.Input(shape=img_size + (3,))
 
-def extract_image_features(img, model):
-    features = get_daisy_descriptor(img)
-        
-    image_clustering = model.predict(features)
-    
-    frequency_counts = pd.DataFrame(image_clustering,columns=['cnt'])['cnt'].value_counts()
-    vec = np.zeros(model.n_clusters)
-    for k in frequency_counts.keys():
-        vec[k] = frequency_counts[k]
-    
-    vec /= np.linalg.norm(vec)
-    return list(vec)
+        ### [First half of the network: downsampling inputs] ###
+
+        # Entry block
+        x = layers.Conv2D(32, 3, strides=2, padding="same")(inputs) # 32-filters; kernel_size=3
+        x = layers.BatchNormalization()(x)
+        x = layers.Activation("relu")(x)
+
+        previous_block_activation = x  # Set aside residual
+
+        # Blocks 1, 2, 3 are identical apart from the feature depth.
+        for filters in [64, 128, 256]:
+            x = layers.Activation("relu")(x)
+            x = layers.SeparableConv2D(filters, 3, padding="same")(x)
+            x = layers.BatchNormalization()(x)
+
+            x = layers.Activation("relu")(x)
+            x = layers.SeparableConv2D(filters, 3, padding="same")(x)
+            x = layers.BatchNormalization()(x)
+
+            x = layers.MaxPooling2D(3, strides=2, padding="same")(x)
+
+            # Project residual
+            residual = layers.Conv2D(filters, 1, strides=2, padding="same")(
+                previous_block_activation
+            )
+            x = layers.add([x, residual])  # Add back residual
+            previous_block_activation = x  # Set aside next residual
+
+        ### [Second half of the network: upsampling inputs] ###
+
+        for filters in [256, 128, 64, 32]:
+            x = layers.Activation("relu")(x)
+            x = layers.Conv2DTranspose(filters, 3, padding="same")(x)
+            x = layers.BatchNormalization()(x)
+
+            x = layers.Activation("relu")(x)
+            x = layers.Conv2DTranspose(filters, 3, padding="same")(x)
+            x = layers.BatchNormalization()(x)
+
+            x = layers.UpSampling2D(2)(x)
+
+            # Project residual
+            residual = layers.UpSampling2D(2)(previous_block_activation)
+            residual = layers.Conv2D(filters, 1, padding="same")(residual)
+            x = layers.add([x, residual])  # Add back residual
+            previous_block_activation = x  # Set aside next residual
+
+        # Add a per-pixel classification layer
+        outputs = layers.Conv2D(num_classes, 3, activation="softmax", padding="same")(x)  # MODIFY HERE
+
+        # Define the model
+        model = keras.Model(inputs, outputs)
+        return model
+
+
+    # Free up RAM in case the model definition cells were run multiple times
+    keras.backend.clear_session()
+
+    # Build model
+    model = get_model(img_size, num_classes)   # MODIFY/CHECK HERE
+    model.compile(optimizer="rmsprop", loss="sparse_categorical_crossentropy")
+    return model
+
+def load_images(image_width,image_height, preProcess, frameFolder):
+    print("Extracting images; {height}x{width}".format(height=image_height,width=image_width))
+    images = []
+
+    lst = natsorted((
+        [
+            os.path.join(frameFolder, fname)
+            for fname in os.listdir(frameFolder)
+            if fname.endswith(".jpg")
+        ]
+    ))
+
+    for idx, filename in enumerate(lst):        
+            fp = os.path.join(frameFolder,filename)
+            if os.path.isfile(fp):
+                img = Image.open(fp).resize((image_height,image_width))
+                arr = np.array(img)
+                arr = preProcess(arr)
+                arr = arr[None,:,:,:]
+                images.append(arr)
+                print("Image {count} out of {total}".format(count=idx+1,total=len(os.listdir(frameFolder))), end="\r")
+    return images
 
 def frameCapture():
     # Path to video file
@@ -48,16 +120,6 @@ def frameCapture():
                 cv2.imwrite(name, image)
             count += 1
     cv2.destroyAllWindows()
-
-def modelPredictionStrategy(model, modelName, images, opts):
-    if modelName == 'bag_of_words':
-        predictions = []
-        clustering = opts['clustering']
-        for idx, image in enumerate(images):            
-            predictions.append(model.predict([extract_image_features(image, clustering)]))
-            print(predictions)
-            print("Image {count} out of {total}".format(count=idx+1,total=len(images)), end="\r")
-    return predictions
     
 def extractFrames(rootDirectory, frameFolderName):
     # for each directory that contains a video and ground truth, makes a "frames"
@@ -87,7 +149,7 @@ if __name__ == "__main__":
 
     parser.add_argument('dir', metavar='dir', type=str, help='folder where the dataset resides')
     parser.add_argument('--frameFolder', default='frames', help='folder where the extracted frames reside', type=str)
-    parser.add_argument('--classificationModel', default='bag_of_words', choices=['bag_of_words','cnn'])
+    parser.add_argument('--classificationModel', default='cnn', choices=['bag_of_words','cnn'])
     
     args = parser.parse_args()
 
@@ -114,28 +176,84 @@ if __name__ == "__main__":
     scriptLocation = os.path.dirname(os.path.realpath(__file__))    
     modelsLocation = os.path.join(scriptLocation, 'models')
     opts = {}
-    # TODO add CNN
-    if args.classificationModel == 'bag_of_words':
-        modelLocation = os.path.join(modelsLocation, 'bag_of_words.pickle')        
-        with open (modelLocation, 'rb') as f:            
-            model = pickle.load(f)
-        clusteringLocation = os.path.join(modelsLocation, 'clustering.pickle')
-        with open(clusteringLocation, 'rb') as f: 
-            opts['clustering'] = pickle.load(f)
+
+    modelLocation = os.path.join(modelsLocation, 'saved')
+    model = keras.models.load_model(modelLocation)
 
     frameFolder = os.path.join(rootDirectory, args.frameFolder)
-    images = []
 
-    print("Extracting images...")    
-    for idx, filename in enumerate(os.listdir(frameFolder)):        
-            fp = os.path.join(frameFolder,filename)
-            if os.path.isfile(fp):
-                img = skimage.io.imread(fp)                
-                gr_img = skimage.color.rgb2gray(img)                
-                gr_img /= gr_img.max()
-                images.append(gr_img)
-                print("Image {count} out of {total}".format(count=idx+1,total=len(os.listdir(frameFolder))), end="\r")
-                
-    predictions = modelPredictionStrategy(model, args.classificationModel, images, opts)
-    print(predictions)
+    # Project 1
+    def proj1_preprocess(arr):
+        arr = tf.keras.applications.xception.preprocess_input(arr)
+        return arr
+        
+
+    images = load_images(480,712, proj1_preprocess, frameFolder)    
+    predictions = []
+    batch = []
+    for idx, image in enumerate(images):
+        pred = model(image, training=False)
+        predictions.append(pred.numpy())
+        print("Image {count} out of {total}".format(count=idx+1,total=len(images)), end="\r")    
+    
+    print("Image informativeness classification complete")
+
+    # Create a basic model instance
+    segModel = create_model((320,320), 2)
+
+    # Load weights from .h5 file
+    polypWeights = os.path.join(modelsLocation, 'polyps_segmentation_2.h5')
+    segModel.load_weights(polypWeights)
+
+    def polypPreprocess(m):
+        return m
+    
+    images = load_images(320,320, polypPreprocess, frameFolder)
+
+    def predicted_mask(pred):
+        mask = np.argmax(pred, axis=-1)
+        mask = np.expand_dims(mask, axis=-1)
+        return mask
+
+    predictionsFolder = os.path.join(rootDirectory, 'predictions')
+    vp = os.path.join(predictionsFolder, 'video.mp4')
+    out = cv2.VideoWriter(vp, cv2.VideoWriter_fourcc(*'mp4v'), 10, (320,320))    
+    
+    if not os.path.exists(predictionsFolder):
+        os.makedirs(predictionsFolder)
+    for idx,image in enumerate(images):
+        pred = segModel(image)
+        mask = predicted_mask(pred)
+        mask = np.reshape(mask,(320,320))
+        # finds all pixels with prop > 0.5
+        binary = mask > 0.5
+        la = label(binary)
+        props = regionprops(la)
+        image = np.reshape(image, (320,320,3))
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        informativeness = predictions[idx]
+        for prop in props:
+            image = cv2.rectangle(image, (prop.bbox[1], prop.bbox[0]), (prop.bbox[3], prop.bbox[2]), (255, 0, 0), 2)
+
+        predString = "Clear: {class_0}%, Blurry: {class_1}%".format(
+            class_0=int(informativeness[0][0]*100),
+            class_1=int(informativeness[0][1]*100))
+            
+        image = cv2.putText(image,
+                            predString,
+                            (20,40),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (255,255,255), 2, cv2.LINE_AA)
+
+        out.write(image)
+        # writes an image to the path instead
+        # fn = "frame_{idx}.jpg".format(idx=idx)
+        # fp = os.path.join(predictionsFolder, fn)
+        # status = cv2.imwrite(fp, image)
+        print("Image {count} out of {total}".format(count=idx+1,total=len(images), end="\r"))            
+        
+    out.release()
+    
+    
     
