@@ -8,6 +8,8 @@ import tensorflow as tf
 from tensorflow import keras
 from skimage.measure import label
 from skimage.measure import regionprops
+from skimage import transform
+from skimage import color
 import PIL
 from PIL import Image
 from tensorflow.keras import layers
@@ -134,27 +136,33 @@ def extractFrames(rootDirectory, frameFolderName):
             if os.path.isfile(filepath):
                 FrameCapture(os.path.splitext(file)[0], filepath, frameFolder)
 
+
+def getImageMask(rootDirectory):
+    gtFolder = os.path.join(rootDirectory, 'GT')
+    filePrefix = os.path.basename(os.path.normpath(rootDirectory))        
+    gtfp = os.path.join(gtFolder,"{fp}_frame_{idx}_GT.tiff".format(idx=idx+1, fp=filePrefix))
+    gt = transform.resize(cv2.imread(gtfp), (320,320))
+    gt = color.rgb2gray(gt)
+    
+    #nonzeroes = gt.nonzero()
+    #x = nonzeroes[0]
+    #y = nonzeroes[1]
+    
+    return gt
+                
 if __name__ == "__main__":
-    """
-     2. load dataset    
-     3. if frames are not extracted, extract frames
-     8. ask user if they want to train the model, or only classify (optional)
-     4. run classification, save in array
-     5. run segmentation
-     6. loop through frames, save classification + segmentation onto video
-     7. save video
-    """
 
     parser = argparse.ArgumentParser()
 
     parser.add_argument('dir', metavar='dir', type=str, help='folder where the dataset resides')
     parser.add_argument('--frameFolder', default='frames', help='folder where the extracted frames reside', type=str)
-    parser.add_argument('--classificationModel', default='cnn', choices=['bag_of_words','cnn'])
+    parser.add_argument('--skipClassification', default=False, type=bool)
     
     args = parser.parse_args()
 
     rootDirectory = os.path.join(os.getcwd(), args.dir)        
     rootDirContents = os.listdir(rootDirectory)
+
     
     if args.frameFolder not in rootDirContents:
         print("Folder {folder} Extracting frames".format(folder=args.frameFolder))
@@ -183,20 +191,21 @@ if __name__ == "__main__":
     frameFolder = os.path.join(rootDirectory, args.frameFolder)
 
     # Project 1
-    def proj1_preprocess(arr):
-        arr = tf.keras.applications.xception.preprocess_input(arr)
-        return arr
+    if not args.skipClassification:
+        def proj1_preprocess(arr):
+            arr = tf.keras.applications.xception.preprocess_input(arr)
+            return arr
         
-
-    images = load_images(480,712, proj1_preprocess, frameFolder)    
-    predictions = []
-    batch = []
-    for idx, image in enumerate(images):
-        pred = model(image, training=False)
-        predictions.append(pred.numpy())
-        print("Image {count} out of {total}".format(count=idx+1,total=len(images)), end="\r")    
+        images = load_images(480,712, proj1_preprocess, frameFolder)    
+        predictions = []    
+        for idx, image in enumerate(images):
+            pred = model(image, training=False)
+            predictions.append(pred.numpy())
+            print("Image {count} out of {total}".format(count=idx+1,total=len(images)), end="\r")    
     
-    print("Image informativeness classification complete")
+        print("Image informativeness classification complete")
+
+    # Project 2
 
     # Create a basic model instance
     segModel = create_model((320,320), 2)
@@ -215,12 +224,17 @@ if __name__ == "__main__":
         mask = np.expand_dims(mask, axis=-1)
         return mask
 
-    predictionsFolder = os.path.join(rootDirectory, 'predictions')
+    predictionsFolder = os.path.join(rootDirectory, 'predictions')    
     vp = os.path.join(predictionsFolder, 'video.mp4')
     out = cv2.VideoWriter(vp, cv2.VideoWriter_fourcc(*'mp4v'), 10, (320,320))    
+
+    tp = []
+    fp = []
+    fn = []
+    tn = []
     
     if not os.path.exists(predictionsFolder):
-        os.makedirs(predictionsFolder)
+        os.makedirs(predictionsFolder)    
     for idx,image in enumerate(images):
         pred = segModel(image)
         mask = predicted_mask(pred)
@@ -229,31 +243,78 @@ if __name__ == "__main__":
         binary = mask > 0.5
         la = label(binary)
         props = regionprops(la)
+        
+        gt = getImageMask(rootDirectory)
+
+
+        # calculates FROC numbers, just need to plot it
+        # determine if mask within bounds
+        gtNZ = gt.nonzero()
+        gtX = gtNZ[0]
+        gtY = gtNZ[1]
+
+        laNZ = la.nonzero()
+        laX = laNZ[0]                   
+        laY = laNZ[1]
+
+        # check if middle point included in gtNZ
+
+        midLAX = laX[int(len(laNZ[0]) / 2)]
+        midLAY = laY[int(len(laNZ[1]) / 2)]        
+
+        if len(gtX) != 0 and len(gtY) != 0:
+            if midLAX in gtX and midLAY in gtY:
+                tp.append(idx)
+            else:
+                fn.append(idx)
+        else:
+            if len(laX) != 0 and len(laY) != 0:
+                fp.append(idx)
+            else:
+                tn.append(idx)
+            
+        
+        #diff = gt - la        
+        #fn = "frame_{idx}.jpg".format(idx=idx+1)
+        #fp = os.path.join(predictionsFolder, fn)
+        #cv2.imwrite(fp,np.absolute(diff) * 255)
+
+        #fn_p = "frame_{idx}_pred.jpg".format(idx=idx+1)
+        #fp_p = os.path.join(predictionsFolder, fn_p)
+        #cv2.imwrite(fp_p,mask * 255)
+
+        # writes an image to the path instead
+        # fn = "frame_{idx}.jpg".format(idx=idx+1)
+        # fp = os.path.join(predictionsFolder, fn)
+        # status = cv2.imwrite(fp, image)
+
+               
         image = np.reshape(image, (320,320,3))
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        informativeness = predictions[idx]
         for prop in props:
             image = cv2.rectangle(image, (prop.bbox[1], prop.bbox[0]), (prop.bbox[3], prop.bbox[2]), (255, 0, 0), 2)
 
-        predString = "Clear: {class_0}%, Blurry: {class_1}%".format(
-            class_0=int(informativeness[0][0]*100),
-            class_1=int(informativeness[0][1]*100))
+        if not args.skipClassification:
+            informativeness = predictions[idx]
+            predString = "Clear: {class_0}%, Blurry: {class_1}%".format(
+                class_0=int(informativeness[0][0]*100),
+                class_1=int(informativeness[0][1]*100))
             
-        image = cv2.putText(image,
-                            predString,
-                            (20,40),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5,
-                            (255,255,255), 2, cv2.LINE_AA)
-
-        out.write(image)
-        # writes an image to the path instead
-        # fn = "frame_{idx}.jpg".format(idx=idx)
-        # fp = os.path.join(predictionsFolder, fn)
-        # status = cv2.imwrite(fp, image)
+            image = cv2.putText(image,
+                                predString,
+                                (20,40),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5,
+                                (255,255,255), 2, cv2.LINE_AA)
+        
+        out.write(image)    
         print("Image {count} out of {total}".format(count=idx+1,total=len(images), end="\r"))            
         
     out.release()
     
-    
+    print("True positives: {tp}".format(tp=len(tp)))
+    print("True negatives: {tn}".format(tn=len(tn)))
+    print("False positives: {fp}".format(fp=len(fp)))
+    print("False negatives: {fn}".format(fn=len(fn)))
+
     
